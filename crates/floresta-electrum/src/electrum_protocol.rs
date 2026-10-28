@@ -566,8 +566,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         }
     }
 
-    pub async fn rebroadcast_mempool_transactions(&self) {
-        let unconfirmed = self.address_cache.find_unconfirmed().unwrap();
+    pub async fn rebroadcast_mempool_transactions(&self) -> Result<(), crate::error::Error> {
+        let unconfirmed = self.address_cache.find_unconfirmed()?;
         for tx in unconfirmed {
             let txid = tx.compute_txid();
             if let Ok(Err(e)) = self.node_interface.broadcast_transaction(tx.clone()).await {
@@ -576,6 +576,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 debug!("Rebroadcasted transaction {txid}");
             }
         }
+        Ok(())
     }
 
     pub async fn main_loop(self) -> Result<(), crate::error::Error> {
@@ -621,7 +622,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 .unwrap_or(true);
 
             if should_rebroadcast {
-                self.rebroadcast_mempool_transactions().await;
+                if let Err(e) = self.rebroadcast_mempool_transactions().await {
+                    error!("Could not rebroadcast mempool transactions: {e}");
+                }
                 self.last_rebroadcast = Some(Instant::now());
             }
 
@@ -697,12 +700,16 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 return Ok(());
             };
 
-            let height = self
+            let Some(height) = self
                 .chain
                 .get_block_height(&block.block_hash())
                 .ok()
                 .flatten()
-                .unwrap();
+            else {
+                error!("Could not get block height for {}", block.block_hash());
+                self.addresses_to_scan.extend(addresses);
+                return Ok(());
+            };
 
             self.handle_block(block, height)?;
         }
@@ -756,7 +763,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             self.address_cache.bump_height(height)?;
         }
 
-        if self.chain.get_height().unwrap() == height {
+        if self.chain.get_height().ok() == Some(height) {
             for client in &mut self.clients.values() {
                 try_and_log!(client.write(serde_json::to_string(&result).unwrap().as_bytes()));
             }
@@ -777,12 +784,10 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             Message::Message((client, msg)) => {
                 trace!("Message: {msg}");
                 if let Ok(req) = serde_json::from_str::<Request>(msg.as_str()) {
-                    let client = self.clients.get(&client);
-                    if client.is_none() {
+                    let Some(client) = self.clients.get(&client).cloned() else {
                         error!("Client sent a message but is not listed as client");
                         return Ok(());
-                    }
-                    let client = client.unwrap().to_owned();
+                    };
                     let id = req.id.to_owned();
                     let res = self.handle_client_request(client.clone(), req).await;
 
@@ -803,12 +808,10 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 } else if let Ok(requests) = serde_json::from_str::<Vec<Request>>(&msg) {
                     let mut results = Vec::new();
                     for req in requests {
-                        let client = self.clients.get(&client);
-                        if client.is_none() {
+                        let Some(client) = self.clients.get(&client).cloned() else {
                             error!("Client sent a message but is not listed as client");
                             return Ok(());
-                        }
-                        let client = client.unwrap().to_owned();
+                        };
                         let id = req.id.to_owned();
                         let res = self.handle_client_request(client.clone(), req).await;
 
@@ -1642,5 +1645,12 @@ mod test {
         assert_eq!(version, "1.4");
         assert_eq!(&batch_response[3]["result"]["protocol_min"], version);
         assert_eq!(&batch_response[3]["result"]["protocol_max"], version);
+    }
+
+    #[tokio::test]
+    async fn test_rebroadcast_mempool_transactions() {
+        let (server, _port) = setup_electrum().await;
+        let res = server.rebroadcast_mempool_transactions().await;
+        assert!(res.is_ok());
     }
 }
